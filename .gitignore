@@ -1,0 +1,32 @@
+# secrets and local config
+.env
+*.env
+!.env.example
+!donut-sync.env.example
+*.pem
+*.key
+sync_token.dat
+api_token.dat
+vault.key
+app_settings.json
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# artifacts
+shot*.png
+*.png
+!docs/**/*.png
+.coverage
+.pytest_cache/
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/

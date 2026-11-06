@@ -1,0 +1,75 @@
+# Caddy 配置：两个站点，一个给同步 API，一个给对象存储（预签名直传用）。
+#
+# 为什么存储也要独立域名：donut-sync 的预签名 URL 按 S3_PUBLIC_ENDPOINT 的
+# host 签名（donut-sync/src/lib.rs:162-191），客户端拿到 URL 后是**直连存储**
+# 上传/下载，不经过同步服务。所以这个 host 必须是设备能解析并访问的地址。
+
+{
+	# 有公网域名 + 可写 80/443 时不用写 email；内网自签时下面这行的 email 被忽略。
+	email {$ACME_EMAIL}
+	# 申请证书失败也不阻塞（内网环境用 host 的内部 CA 证书即可）
+	# 内网请改为 `auto_https disable_redirects` 并在站点里显式 tls internal
+}
+
+# 同步 API
+{$SYNC_HOST} {
+	# --- 想用内网自签就把下面这行打开，并把上面 global 的 email 留空 ---
+	# tls internal
+
+	encode zstd gzip
+
+	# 同步是长连接 + SSE，禁止中间层缓冲，并把超时放大
+	reverse_proxy donut-sync:12342 {
+		flush_interval -1
+		transport http {
+			read_timeout 0
+			write_timeout 0
+			dial_timeout 10s
+		}
+	}
+
+	header {
+		# 同步内容含用户数据，任何缓存都只是风险
+		Cache-Control "no-store"
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		- via
+		- server
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
+
+# 对象存储（预签名 URL 直传/直取）
+{$S3_HOST} {
+	# tls internal
+
+	# 大文件分片上传：放开请求体上限到 8 GiB（按需调整）
+	request_body {
+		max_size 8GB
+	}
+
+	reverse_proxy s3:9000 {
+		transport http {
+			read_timeout 0
+			write_timeout 0
+			dial_timeout 10s
+		}
+	}
+
+	header {
+		# 预签名 URL 自带鉴权，不要让任何中间层缓存对象
+		Cache-Control "no-store"
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		- via
+		- server
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

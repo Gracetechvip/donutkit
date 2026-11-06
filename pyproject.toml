@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "donutkit"
+version = "0.1.0"
+description = "Stdlib-only SDK for the Donut Browser local API, a self-hosted donut-sync server, and Wayfern's CDP endpoint"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "donutkit contributors" }]
+keywords = ["donut-browser", "antidetect", "cdp", "chrome-devtools-protocol", "automation", "s3"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+donutkit = "donutkit.cli:main"
+
+[project.urls]
+Source = "https://github.com/Gracetechvip/donutkit"
+
+[tool.hatch.build.targets.wheel]
+packages = ["donutkit"]

@@ -1,0 +1,179 @@
+# Donut Sync — 自托管端到端加密同步服务器（生产级）
+#
+# 依据源码事实配置，不是照抄上游的测试 compose：
+#   - donut-sync/src/config.rs          → 全部环境变量名
+#   - donut-sync/src/lib.rs:66..92      → 启动前校验（SYNC_TOKEN 必须 ≥24 字符且非占位值）
+#   - donut-sync/src/lib.rs:54          → DEFAULT_PORT = 3929（镜像与 .env.example 用 12342）
+#   - donut-sync/src/lib.rs:162..191    → 预签名 URL 按 S3_PUBLIC_ENDPOINT 签名
+#   - donut-sync/src/sync.rs:250..259   → 桶不存在时自动创建
+#   - donut-sync/src/sync.rs:272..305   → 单标签主机（如 minio）会告警：客户端打不开
+#   - donut-sync/src/store.rs, s3.rs    → 没有数据库，只有 S3 对象（“schema”= 对象键前缀 users/<sub>/）
+#
+# 两种拓扑：
+#   A. 同机（默认，不需要 caddy）：donut-sync 与对象存储都只发布在 127.0.0.1
+#        docker compose -f docker-compose.sync.yml up -d
+#        App 里填 http://127.0.0.1:12342 + SYNC_TOKEN，即可同步
+#   B. 跨设备/公网（需要两个域名，启用 caddy）
+#        docker compose -f docker-compose.sync.yml --profile tls up -d
+#
+# 启动：
+#   cp donut-sync.env.example .env && ${EDITOR:-vi} .env
+#   docker compose -f docker-compose.sync.yml up -d
+#   curl -fsS http://127.0.0.1:12342/health   # {"status":"ok"}
+#   curl -fsS http://127.0.0.1:12342/readyz   # {"status":"ready","s3":true,...}
+
+name: donut-sync
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ---------------------------------------------------------------------------
+  # S3 兼容对象存储。
+  # 用 rclone 而不是 MinIO：上游 docker-compose.yml 的注释明确写了 MinIO 已撤下
+  # 社区镜像（quay.io 401、Docker Hub 拒拉），本机实测 minio/minio:latest 也不可拉。
+  # 生产环境请换成你真正在用的 S3（AWS / R2 / B2），把 S3_* 指过去即可。
+  # ---------------------------------------------------------------------------
+  s3:
+    image: rclone/rclone:latest
+    restart: unless-stopped
+    command:
+      - serve
+      - s3
+      - /data
+      - --addr
+      - ":9000"
+      # 凭据只从环境取，不写在命令行里（命令行会出现在 ps 与容器 inspect 中）
+      - --auth-key
+      - ${S3_ACCESS_KEY_ID:?set S3_ACCESS_KEY_ID in .env},${S3_SECRET_ACCESS_KEY:?set S3_SECRET_ACCESS_KEY in .env}
+      - --force-path-style
+      - --vfs-cache-mode
+      - writes
+    environment:
+      TZ: ${TZ:-UTC}
+    volumes:
+      - s3-data:/data
+    # 预签名 URL 是**设备直连存储**的，所以这个端口必须对设备可达。
+    # 同机使用：只绑回环（下面这行）；跨设备使用：改成 "<LAN IP>:9000:9000"
+    # 或启用 --profile tls 走 caddy 的 s3.<域名>。S3_PUBLIC_ENDPOINT 必须与
+    # 设备实际能访问的地址一致，否则传输全挂而 /health 仍绿。
+    ports:
+      - "127.0.0.1:${S3_LOCAL_PORT:-9000}:9000"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "9000"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    logging: *logging
+    security_opt:
+      - no-new-privileges:true
+
+  # ---------------------------------------------------------------------------
+  # 同步服务本体。
+  #
+  # 镜像选择（实测结论，别跳过）：
+  #   v0.36.0 / :latest  稳定版，但**不认 SYNC_AT_REST_KEY**（传进去被静默忽略，
+  #                      预签名响应里也没有 transfer 字段）→ 只能靠客户端 E2E。
+  #   nightly-bf04652    与本文档审计的 main 一致：校验 at-rest key，预签名响应
+  #                      带 transfer（上传/下载经服务端转发加密）。
+  # 想要 100% 与源码一致，就别用 :latest；要么用下面钉住的 nightly，要么解开
+  # build 行从 ../donutbrowser/donut-sync 自己构建。
+  # ---------------------------------------------------------------------------
+  donut-sync:
+    image: ${DONUT_SYNC_IMAGE:-donutbrowser/donut-sync:nightly-bf04652}
+    # build: ../donutbrowser/donut-sync
+    restart: unless-stopped
+    depends_on:
+      s3:
+        condition: service_healthy
+    environment:
+      # --- 认证（二选一或并存）------------------------------------------------
+      # SYNC_TOKEN：登出状态的共享密钥。谁拿到它就能读写整个桶。
+      #   必须 ≥24 字符，且不能是 CHANGE_ME* / secret-sync-token（lib.rs:57-92）。
+      SYNC_TOKEN: "${SYNC_TOKEN:?generate one with openssl rand -hex 32}"
+      # SYNC_PUBLIC_URL：允许“已登录的 Donut 付费账号”把设备指到这台服务器。
+      #   必须与用户在 App 里填的地址逐字一致（令牌按它绑定）；服务器要能访问
+      #   https://api.donutbrowser.com 校验登录令牌。
+      SYNC_PUBLIC_URL: ${SYNC_PUBLIC_URL:-}
+      # --- 监听 ---------------------------------------------------------------
+      PORT: "12342"
+      # --- S3（无默认值，缺一即拒绝启动）--------------------------------------
+      S3_ENDPOINT: http://s3:9000
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ACCESS_KEY_ID: "${S3_ACCESS_KEY_ID:?set S3_ACCESS_KEY_ID in .env}"
+      S3_SECRET_ACCESS_KEY: "${S3_SECRET_ACCESS_KEY:?set S3_SECRET_ACCESS_KEY in .env}"
+      S3_BUCKET: ${S3_BUCKET:-donut-sync}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      # ⚠ 关键：预签名 URL 按这个地址签名（lib.rs:162）。若留空，会退化成
+      #   S3_ENDPOINT=http://s3:9000 —— 那是 compose 内部主机名，客户端拿到
+      #   打不开的 URL，而 /health 与 /readyz 依旧是绿的（sync.rs:277-300 会告警）。
+      S3_PUBLIC_ENDPOINT: "${S3_PUBLIC_ENDPOINT:?e.g. https://s3.example.com}"
+      # --- 静态加密（可选，与服务端无关的第二层）------------------------------
+      # 格式 id:base64(32 bytes)，可多版本轮换，首个加密其余解密：
+      #   k1:$(openssl rand -base64 32)
+      # 这与客户端 E2E 独立：即使客户端没开 E2E，服务端落盘也是密文。
+      SYNC_AT_REST_KEY: ${SYNC_AT_REST_KEY:-}
+      # --- 仅供 Donut 云自身部署使用，自建不要设置 ----------------------------
+      # SYNC_JWT_PUBLIC_KEY / BACKEND_INTERNAL_URL / BACKEND_INTERNAL_KEY
+      TZ: ${TZ:-UTC}
+    # 服务端只从环境读配置（/app/.env 是等价物但不挂载：缺失的 bind 源会被
+    # docker 建成目录，把容器启动搞坏）。需要文件时用 --env-file。
+    # 只在本机回环上暴露健康检查端口；对外一律走 caddy
+    ports:
+      - "127.0.0.1:${SYNC_LOCAL_PORT:-12342}:12342"
+    healthcheck:
+      # 镜像基于 alpine，自带 wget（Dockerfile 注释里明说保留它是给健康检查用的）
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:12342/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    logging: *logging
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # ---------------------------------------------------------------------------
+  # TLS 反向代理（可选，`--profile tls` 才启动）。
+  #
+  # 同一台机器上跑 Donut 与同步服务时**不需要它**：默认配置把 donut-sync 与对象
+  # 存储都发布在 127.0.0.1 上，App 直连即可。要跨设备/公网访问时才启用：
+  #   docker compose --profile tls up -d
+  # 并准备两个主机名：sync.<域名> → donut-sync，s3.<域名> → 对象存储（预签名 URL
+  # 是设备直连存储的，所以存储也要有设备能解析的地址）。
+  # ---------------------------------------------------------------------------
+  caddy:
+    profiles: ["tls"]
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - donut-sync
+      - s3
+    environment:
+      SYNC_HOST: ${SYNC_HOST:?e.g. sync.example.com}
+      S3_HOST: ${S3_HOST:?e.g. s3.example.com}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    logging: *logging
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  s3-data: {}
+  caddy-data: {}
+  caddy-config: {}
